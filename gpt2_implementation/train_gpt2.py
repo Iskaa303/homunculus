@@ -83,7 +83,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence length {T}, model block size is {self.config.block_size}"
         # forward the token and position embeddings
@@ -96,8 +96,13 @@ class GPT(nn.Module):
             x = block(x)
         # forward the final layer norm
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -150,19 +155,47 @@ class GPT(nn.Module):
 
 def main():
     from dotenv import load_dotenv
-    import os
 
     load_dotenv()
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    num_return_sequences = 5
-    max_length = 30
-    
-    model = GPT.from_pretrained("gpt2")
-    model.to(device)
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"Using device: {device}")
     
     import tiktoken
     enc = tiktoken.get_encoding("gpt2")
+    with open("./data/tinyshakespeare.txt", "r") as f:
+        text = f.read()
+    text = text[:1000] # only use the first 1000 characters for testing
+    tokens = enc.encode(text)
+    B, T = 4, 32
+    buf = torch.tensor(tokens[:B * T + 1])
+    buf = buf.to(device)
+    x = buf[:-1].view(B, T)
+    y = buf[1:].view(B, T)
+    
+    # get logits
+    model = GPT(GPTConfig())
+    model.to(device)
+    
+    # optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    for i in range(50):
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+        print(f"step {i}: loss {loss.item():.4f}")
+    
+    import sys; sys.exit()
+    
+    # sampling logic
+    model.eval()
+    num_return_sequences = 5
+    max_length = 30
     tokens = enc.encode("Hello, I'm IsraelGPT,")
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
