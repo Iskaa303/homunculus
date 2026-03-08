@@ -1,52 +1,94 @@
 import torch
-import time
+import torch.nn as nn
+from torch.nn import functional as F
 
-def check_torch_environment():
-    print("--- PyTorch Environment Report ---")
-    print(f"PyTorch Version: {torch.__version__}")
-    
-    cuda_available = torch.cuda.is_available()
-    print(f"Is CUDA available? {cuda_available}")
-    
-    device = torch.device("cuda" if cuda_available else "cpu")
-    print(f"Using device: {device}")
-    
-    if device.type == "cuda":
-        print(f"GPU Device Name: {torch.cuda.get_device_name(0)}")
-        print(f"Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
-        print(f"Memory Reserved:  {torch.cuda.memory_reserved(0) / 1024**2:.2f} MB")
-    else:
-        print("Running on CPU (No GPU detected or 'cpu' extra installed).")
-    
-    print("-" * 34)
-    return device
+batch_size = 32
+block_size = 8
+max_iters = 3000
+eval_interval = 300
+learning_rate = 1e-2
+device = "cuda" if torch.cuda.is_available() else "cpu"
+eval_iters = 200
 
-def run_sample_operation(device):
-    print(f"\nPerforming sample operation on {device}...")
-    
-    # Create two large random matrices directly on the target device
-    # This avoids the overhead of creating on CPU and moving to GPU
-    size = 2000
-    a = torch.randn(size, size, device=device)
-    b = torch.randn(size, size, device=device)
-    
-    # Matrix Multiplication (matmul)
-    start_time = time.time()
-    result = torch.matmul(a, b)
-    
-    # Synchronize if using CUDA to get accurate timing
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        
-    end_time = time.time()
-    
-    print(f"Result shape: {result.shape}")
-    print(f"Operation took: {end_time - start_time:.4f} seconds")
+torch.manual_seed(1337)
 
-def main():
-    current_device = check_torch_environment()
-    run_sample_operation(current_device)
+with open("./data/tinyshakespeare.txt", "r") as f:
+    text = f.read()
 
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
 
-if __name__ == "__main__":
-    main()
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: "".join([itos[i] for i in l])
+
+data = torch.tensor(encode(text), dtype=torch.long)
+n = int(0.9 * len(data))
+train_data = data[:n]
+val_data = data[n:]
+
+def get_batch(split):
+    data = train_data if split == "train" else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i : i + block_size] for i in ix])
+    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
+    return x.to(device), y.to(device)
+
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+class BigramLanguageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+
+    def forward(self, idx, targets=None):
+        logits = self.token_embedding_table(idx)
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B * T, C)
+            targets = targets.view(B * T)
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            logits, _ = self(idx)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
+model = BigramLanguageModel().to(device)
+m = model.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+for iter in range(max_iters):
+    if iter % eval_interval == 0:
+        losses = estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+    xb, yb = get_batch("train")
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
