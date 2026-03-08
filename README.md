@@ -16,3 +16,9 @@ and
 uv sync --extra cu130
 ```
 respectively
+
+# GPT-2 implementation
+To use OpenAI's OG GPT-2 locally, run this command:
+```bash
+uvx hf download gpt2 --local-dir gpt2
+```
