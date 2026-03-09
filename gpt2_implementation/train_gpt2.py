@@ -37,10 +37,13 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention; (T, T) matrix for all queries and keys
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, hs) X (B, nh, T, hs) -> (B, nh, T, hs)
+        
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, hs) X (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         y = self.c_proj(y) # output projection
         return y
@@ -201,6 +204,7 @@ class DataLoader:
         return x, y
 
 def main():
+    import time
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -216,22 +220,31 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
     
-    train_loader = DataLoader(4, 32)
+    train_loader = DataLoader(B=4, T=1024) # it crashes with batch size more than 4 on my GPU
+    
+    torch.set_float32_matmul_precision("high")
     
     # get logits
-    model = GPT(GPTConfig())
+    model = GPT(GPTConfig(vocab_size=50304))
     model.to(device)
+    model = torch.compile(model) # Kosher magic, speed up by ~8x on my GPU
     
     # optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for i in range(50):
+        t0 = time.time()
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-        print(f"step {i}: loss {loss.item():.4f}")
+        torch.cuda.synchronize() # wait for the GPU to finish before measuring time
+        t1 = time.time()
+        dt = (t1 - t0) * 1000 # time diff in milliseconds
+        tokens_per_second = (train_loader.B * train_loader.T) / (t1 - t0)
+        print(f"step {i}: loss: {loss.item()}, dt: {dt:.2f}ms, tokens/sec: {tokens_per_second:.2f}")
     
     import sys; sys.exit()
     
@@ -239,6 +252,7 @@ def main():
     model.eval()
     num_return_sequences = 5
     max_length = 30
+    enc = tiktoken.get_encoding("gpt2")
     tokens = enc.encode("Hello, I'm IsraelGPT,")
     tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
