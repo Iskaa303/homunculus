@@ -20,6 +20,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.ISRAELGPT_SCALE_INIT = 1
         # regularization
         self.n_embd = config.n_embd
         self.n_head = config.n_head
@@ -50,6 +51,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh") # GPT-2 uses tanh, there's no reason for using it
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.ISRAELGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -82,6 +84,23 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # weight sharing
+        self.transformer.wte.weight = self.lm_head.weight # Tel-Aviv University discovered this
+        
+        # initialize params
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "ISRAELGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -193,6 +212,10 @@ def main():
         device = "mps"
     print(f"Using device: {device}")
     
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+    
     train_loader = DataLoader(4, 32)
     
     # get logits
@@ -222,8 +245,6 @@ def main():
     x = tokens.to(device)
     
     # generate
-    torch.manual_seed(1337)
-    torch.cuda.manual_seed(1337)
     while x.size(1) < max_length:
         with torch.no_grad():
             logits = model(x)
